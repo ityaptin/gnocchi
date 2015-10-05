@@ -58,6 +58,30 @@ OPTS = [
 LOG = logging.getLogger(__name__)
 START_EPOCH = datetime.datetime(1, 1, 1, tzinfo=iso8601.iso8601.UTC)
 
+def make_expression(op='and', filter=None):
+    if not filter:
+        return ''
+    if isinstance(filter, list):
+        pass
+
+
+def filter_to_query(filter=None):
+    if filter or not isinstance(filter, dict):
+        pass
+    else:
+        raise ValueError("Filter should be a dict")
+
+
+def parse_serie(serie):
+    parts = serie.split(",")
+    if not parts or len(parts) == 1:
+        return ''
+    where_tags = []
+    for tag in parts[1:]:
+        key_value = tag.strip().split("=")
+        where_tags.append((key_value[0], key_value[-1]))
+
+    return " and ".join("%s='%s'" % tag for tag in where_tags if tag)
 
 class InfluxDBStorage(storage.StorageDriver):
 
@@ -270,6 +294,77 @@ class InfluxDBStorage(storage.StorageDriver):
             metrics, from_timestamp, to_timestamp, aggregation, needed_overlap)
         raise exceptions.NotImplementedError
 
+    def get_available_metrics(self, measurement=None, **kwargs):
+        where_line = " and ".join("%s='%s'" % item for item in kwargs.items()
+                                  if item[1])
+        query = "SHOW SERIES " + ("" if not measurement
+                                  else "FROM \"%s\" " % measurement) + \
+                (("WHERE %s" % where_line) if where_line else "")
+
+        metrics = []
+        response = self._query(None, query)
+        for name, points in response.items():
+            for point in points:
+                metrics.append({"metric": name[0], "resource": point})
+        return metrics
+
+    def get_raw_measures(self, metric, serie, from_timestamp=None,
+                         to_timestamp=None, aggregation="mean",
+                         archive_policy=None):
+        if from_timestamp:
+            from_timestamp = self._timestamp_to_utc(from_timestamp)
+        if to_timestamp:
+            to_timestamp = self._timestamp_to_utc(to_timestamp)
+
+        if from_timestamp:
+            first_measure_timestamp = from_timestamp
+        else:
+            result = self._query(metric, "select * from \"%(metric_id)s\" limit 1" %
+                                 dict(metric_id=metric))
+            result = list(result[metric])
+            if result:
+                first_measure_timestamp = self._timestamp_to_utc(
+                    timeutils.parse_isotime(result[0]['time']))
+            else:
+                first_measure_timestamp = None
+
+        query = ("SELECT %(aggregation)s(value) FROM \"%(metric_id)s\""
+                 % dict(aggregation=aggregation,
+                        metric_id=metric))
+        where_query = parse_serie(serie)
+        timestamp_query = self._make_time_query(first_measure_timestamp,
+                                                to_timestamp, 1)
+
+        results = []
+        for definition in sorted(
+                archive_policy.definition,
+                key=operator.attrgetter('granularity')):
+            time_query = self._make_time_query(
+                first_measure_timestamp,
+                to_timestamp,
+                definition.granularity)
+            subquery = " and ".join([where_query, timestamp_query])
+            subquery = (query +
+                        " WHERE %(times)s GROUP BY time(%(granularity)ds) "
+                        "fill(none) LIMIT %(points)d" %
+                        dict(times=subquery,
+                             granularity=definition.granularity,
+                             points=definition.points))
+
+            result = self._query(metric, subquery)
+
+            subresults = []
+            for point in result[metric]:
+                timestamp = self._timestamp_to_utc(
+                    timeutils.parse_isotime(point['time']))
+                if (point[aggregation] is not None and
+                    ((from_timestamp is None or timestamp >= from_timestamp)
+                     and (to_timestamp is None or timestamp < to_timestamp))):
+                    subresults.insert(0, (timestamp,
+                                          definition.granularity,
+                                          point[aggregation]))
+            results.extend(subresults)
+        return results
 
 def find_nearest_stable_point(timestamp, granularity, next=False):
     """Find the timetamp before another one for a particular granularity.

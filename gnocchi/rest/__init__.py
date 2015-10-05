@@ -911,6 +911,116 @@ class ImageResourceController(GenericResourceController):
         "disk_format": six.text_type,
     })
 
+class LMAMetricController(rest.RestController):
+    _custom_actions = {
+        'measures': ['GET']
+    }
+
+    def __init__(self, metric, serie):
+        self.metric_name = metric
+        self.serie = serie
+        self.resource_type = 'lma'
+
+    @pecan.expose('json')
+    def get_measures(self, start=None, stop=None, aggregation="mean",
+                     archive_policy="low"):
+
+        if start is not None:
+            try:
+                start = Timestamp(start)
+            except Exception:
+                abort(400, "Invalid value for start")
+
+        if stop is not None:
+            try:
+                stop = Timestamp(stop)
+            except Exception:
+                abort(400, "Invalid value for stop")
+
+        try:
+            ap = pecan.request.indexer.get_archive_policy(archive_policy)
+        except indexer.NoSuchArchivePolicy as e:
+            abort(500, e.message)
+
+
+        try:
+
+            return pecan.request.storage.get_raw_measures(self.metric_name,
+                                                          self.serie,
+                                                          start, stop,
+                                                          aggregation, ap)
+        except Exception as e:
+            print e
+            abort(500)
+
+
+class LMAMetricsController(rest.RestController):
+    def __init__(self, metric_name=None, resource_serie=None):
+        self.serie = resource_serie
+        self.metric = metric_name
+
+    @pecan.expose()
+    def _lookup(self, name, *remainder):
+        return LMAMetricController(name, self.serie), remainder
+
+    @pecan.expose('json')
+    def get_all(self):
+        return {
+            "archive_policy": None,
+            "name": self.metric,
+            "user_id": None,
+            "project_id": None
+        }
+
+
+
+class LMAResourceController(GenericResourceController):
+    _resource_type = 'lma'
+
+    def __init__(self, serie):
+        try:
+            self.serie = serie
+        except ValueError:
+            abort(404)
+        self.metric = LMAMetricsController(serie.split(",")[0], serie)
+
+    def serie_to_dict(self):
+        parts = self.serie.split(",")
+
+        tags = {}
+        if len(parts) > 0:
+            tags['measurement'] = parts[0]
+            for tag in parts[1:]:
+                key_value = tag.strip().split("=")
+                tags[key_value[0]] = key_value[-1]
+            return tags
+        return {}
+
+    @pecan.expose('json')
+    @pecan.expose('resources.j2')
+    def get(self):
+        try:
+            metrics = pecan.request.storage.get_available_metrics(
+                **self.serie_to_dict())
+            return {"resource_type": "lma",
+                    "resource_id": "generic",
+                    "metrics": {metrics[0]['metric']: ""}}
+
+        except Exception as e:
+            abort(400)
+
+    @pecan.expose('json')
+    @pecan.expose('resources.j2')
+    def patch(self):
+        abort(503)
+
+    @staticmethod
+    def _delete_metrics(metrics):
+        abort(503)
+
+    @pecan.expose()
+    def delete(self):
+        abort(503)
 
 class GenericResourcesController(rest.RestController):
     _resource_type = 'generic'
@@ -1035,6 +1145,54 @@ class ImageResourcesController(GenericResourcesController):
 
     Resource = ImageResourceController.Resource
 
+
+class LMAResourcesController(GenericResourcesController):
+    _resource_type = 'lma'
+    _resource_rest_class = LMAResourceController
+
+    @pecan.expose('json')
+    def post(self):
+        pass
+
+    @pecan.expose('json')
+    def get_all(self, **kwargs):
+
+        try:
+            enforce("list all resource", {
+                "resource_type": self._resource_type,
+            })
+        except webob.exc.HTTPForbidden:
+            enforce("list resource", {
+                "resource_type": self._resource_type,
+            })
+
+        try:
+            metrics = pecan.request.storage.get_available_metrics(
+                **{"deployment_id": "2"})
+
+            resources = []
+            for metric in metrics:
+                m = metric['metric']
+                r = metric['resource']
+                if '_key' in r:
+                    id = r['_key']
+                    del r['_key']
+                resource = {
+                    "resource_id": id,
+                    "metrics": {
+                        m: ""
+                    },
+                    'project_id': '',
+                    'created_by_project_id': '',
+                    'user_id': '',
+                    'created_by_user_id': '',
+
+                }
+                resource.update(r)
+                resources.append(resource)
+            return resources
+        except Exception as e:
+            abort(400)
 
 class ResourcesController(rest.RestController):
     resources_ctrl_by_type = dict(
